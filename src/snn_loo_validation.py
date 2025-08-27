@@ -5,15 +5,10 @@ import numpy as np
 import math
 
 import random
-import keras
-from keras.models import Model, Sequential
-from keras.layers import Input, Flatten, Dense, Dropout, Lambda, Conv2D, MaxPooling2D, dot, BatchNormalization
-from keras.backend import dot, sqrt
-from keras.callbacks import EarlyStopping, ModelCheckpoint, Callback
-from keras.optimizers import RMSprop, Adam, SGD
-from keras import regularizers
-from keras.losses import hinge
-from keras import backend as K
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader, TensorDataset
 
 from sklearn.svm import SVC
 from sklearn.naive_bayes import GaussianNB
@@ -22,15 +17,11 @@ from sklearn.neighbors import KNeighborsClassifier
 from sklearn.ensemble import RandomForestClassifier
 
 
-import tensorflow as tf
-
 import os
 
 import optimize_classifier as opt_clf
 
 import time as time_lib
-
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '3'  # or any {'0', '1', '2'}
 
 num_classes = 2
 epochs = 20
@@ -42,13 +33,11 @@ from scipy.signal import stft
 from scipy.signal import get_window
 from scipy.spatial.distance import cosine, chebyshev
 
-frequencies_nomenclature = ['delta', 'theta1', 'theta2', 'alpha1', 'alpha2', 
+frequencies_nomenclature = ['delta', 'theta1', 'theta2', 'alpha1', 'alpha2',
                    'beta1', 'beta2', 'beta3', 'gamma']
 
 channel_nomenclature = ['F7', 'F3', 'F4', 'F8', 'T3', 'C3', 'Cz', 'C4', 'T4',
                     'T5', 'P3', 'Pz', 'P4', 'T6', 'O1', 'O2']
-
-init = keras.initializers.glorot_uniform(seed=0)
 
 def stft_to_freq_bin(freq_map, frequencies, timesteps):
     #at each time step binarize the frequencies freq_map[:,0]
@@ -116,43 +105,20 @@ def normalize_features(x, max_magnitude=300):
                     else:
                         x[ind][freq][time][feature] = 1.0
 
-def cosine_distance(vects):
-    x,y = vects
-    #how should the normalization be done??
-    x = K.l2_normalize(x, axis=1)
-    y = K.l2_normalize(y, axis=1)
+def cosine_distance(x, y):
+    x = F.normalize(x, p=2, dim=1)
+    y = F.normalize(y, p=2, dim=1)
+    return 1 - torch.sum(x * y, dim=1, keepdim=True)
 
-    a = K.batch_dot(x, y, axes=1)
-
-    b = K.batch_dot(x, x, axes=1)
-    c = K.batch_dot(y, y, axes=1)
-
-    return 1 - (a / (K.sqrt(b) * K.sqrt(c)))
-    #line below is correct
-    #return K.mean(1-K.abs(K.batch_dot(x, y, axes=1)))
-
-def cos_dist_output_shape(shapes):
-    shape1, shape2 = shapes
-    return (shape1[0], 1)
-
-def euclidean_distance(vects):
-    x, y = vects
-    sum_square = K.sum(K.square(x - y), axis=1, keepdims=True)
-    return K.sqrt(K.maximum(sum_square, K.epsilon()))
-
-
-def eucl_dist_output_shape(shapes):
-    shape1, shape2 = shapes
-    return (shape1[0], 1)
-
-class contrastive_loss():
+class ContrastiveLoss(nn.Module):
     def __init__(self, margin):
+        super().__init__()
         self.margin = margin
 
-    def loss(self, y_true, y_pred):
-        square_pred = K.square(y_pred)
-        margin_square = K.square(K.maximum(self.margin - y_pred, 0))
-        return K.mean(y_true * square_pred + (1 - y_true) * margin_square)
+    def forward(self, y_true, y_pred):
+        square_pred = y_pred.pow(2)
+        margin_square = torch.clamp(self.margin - y_pred, min=0).pow(2)
+        return torch.mean(y_true * square_pred + (1 - y_true) * margin_square)
 
 def create_pairs(x, y, n_channels=16):
     pairs = []
@@ -178,83 +144,109 @@ def create_pairs(x, y, n_channels=16):
     return pairs, labels
 
 
-def create_base_network(input_shape, kernel_size=(6,6), final_dimension=12, regularization=0.011):
-    ##model building
-    model = Sequential()
-    #convolutional layer with rectified linear unit activation
-    #flatten since too many dimensions, we only want a classification output
-    model.add(Conv2D(1, kernel_size=kernel_size,
-                     activation='relu',
-                     input_shape=input_shape, kernel_initializer=init,
-                bias_initializer='zeros',
-                kernel_regularizer=regularizers.l1(regularization),#0.011
-                bias_regularizer=regularizers.l1(regularization)))#0.011
-    
-    model.add(Dropout(0.5))
-    model.add(Conv2D(1, kernel_size=kernel_size,
-                    activation='relu', kernel_initializer=init,
-                bias_initializer='zeros',
-                kernel_regularizer=regularizers.l1(regularization),#0.011
-                bias_regularizer=regularizers.l1(regularization)))#0.011
-    
-    model.add(Dropout(0.5))
-    #things to test in order to increase the performance of the mdel
-    #play a little with the kernel sizes - test values: (6,6)
-    #change the optimization function - 
-    model.add(Flatten())
-    #embedding sizes with better results seem to be between [8,15[
-    model.add(Dense(final_dimension, activation='softmax', kernel_initializer=init,
-                bias_initializer='zeros'))#13
-    print(model.summary())
-    return model
+class BaseNetwork(nn.Module):
+    def __init__(self, input_shape, kernel_size=(6,6), final_dimension=12, regularization=0.011):
+        super().__init__()
+        self.regularization = regularization
+        self.conv1 = nn.Conv2d(1, 1, kernel_size=kernel_size)
+        self.dropout1 = nn.Dropout(0.5)
+        self.conv2 = nn.Conv2d(1, 1, kernel_size=kernel_size)
+        self.dropout2 = nn.Dropout(0.5)
+        self.flatten = nn.Flatten()
+
+        dummy = torch.zeros(1, 1, input_shape[0], input_shape[1])
+        with torch.no_grad():
+            out = self._forward_features(dummy)
+        self.fc = nn.Linear(out.shape[1], final_dimension)
+
+        nn.init.xavier_uniform_(self.conv1.weight)
+        nn.init.zeros_(self.conv1.bias)
+        nn.init.xavier_uniform_(self.conv2.weight)
+        nn.init.zeros_(self.conv2.bias)
+        nn.init.xavier_uniform_(self.fc.weight)
+        nn.init.zeros_(self.fc.bias)
+
+    def _forward_features(self, x):
+        x = F.relu(self.conv1(x))
+        x = self.dropout1(x)
+        x = F.relu(self.conv2(x))
+        x = self.dropout2(x)
+        x = self.flatten(x)
+        return x
+
+    def forward(self, x):
+        x = self._forward_features(x)
+        x = F.softmax(self.fc(x), dim=1)
+        return x
 
 def compute_accuracy(y_true, y_pred):
     pred = y_pred.ravel() < 0.5
     return np.mean(pred == y_true)
 
 
-def accuracy(y_true, y_pred):
-    return K.mean(K.equal(y_true, K.cast(y_pred < 0.5, y_true.dtype)))
-
-
-class siamese:
+class siamese(nn.Module):
     def __init__(self, input_shape, regularization=0.011, kernel_size=(6,6), final_dimension=12, learning_rate=0.0004, margin=1.2):
-        self.base_network = create_base_network(input_shape, kernel_size, final_dimension, regularization)
+        super().__init__()
+        self.base_network = BaseNetwork(input_shape, kernel_size, final_dimension, regularization)
+        self.regularization = regularization
+        self.criterion = ContrastiveLoss(margin)
+        self.optimizer = torch.optim.Adam(self.parameters(), lr=learning_rate)
 
-        input_a = Input(shape=input_shape)
-        input_b = Input(shape=input_shape)
+    def forward(self, x1, x2):
+        out1 = self.base_network(x1)
+        out2 = self.base_network(x2)
+        return cosine_distance(out1, out2)
 
-        # because we re-use the same instance `base_network`,
-        # the weights of the network
-        # will be shared across the two branches
-        processed_a = self.base_network(input_a)
-        processed_b = self.base_network(input_b)
+    def fit(self, pairs, labels, batch_size, epochs):
+        dataset = TensorDataset(
+            torch.tensor(pairs[:,0]).permute(0,3,1,2).float(),
+            torch.tensor(pairs[:,1]).permute(0,3,1,2).float(),
+            torch.tensor(labels).float()
+        )
+        loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        self.train()
+        for _ in range(epochs):
+            for x1, x2, y in loader:
+                self.optimizer.zero_grad()
+                output = self.forward(x1, x2)
+                loss = self.criterion(y.view_as(output), output)
+                l1_reg = torch.tensor(0., device=output.device)
+                for param in self.parameters():
+                    l1_reg += torch.norm(param, 1)
+                loss = loss + self.regularization * l1_reg
+                loss.backward()
+                self.optimizer.step()
 
-        distance = Lambda(cosine_distance,#compare this results with euclidean
-                          output_shape=cos_dist_output_shape)([processed_a, 
-                          processed_b])
+    def predict(self, pairs, batch_size=None):
+        if batch_size is None:
+            batch_size = len(pairs)
+        dataset = TensorDataset(
+            torch.tensor(pairs[:,0]).permute(0,3,1,2).float(),
+            torch.tensor(pairs[:,1]).permute(0,3,1,2).float()
+        )
+        loader = DataLoader(dataset, batch_size=batch_size)
+        self.eval()
+        preds = []
+        with torch.no_grad():
+            for x1, x2 in loader:
+                preds.append(self.forward(x1, x2))
+        self.train()
+        return torch.cat(preds).cpu().numpy()
 
-        model = Model([input_a, input_b], distance)
-
-        adam = Adam(lr=learning_rate)
-        loss_function = contrastive_loss(margin)
-        model.compile(loss=loss_function.loss, optimizer=adam, metrics=[accuracy])
-        self.model = model
+    def get_embeddings(self, x, batch_size=None):
+        if batch_size is None:
+            batch_size = len(x)
+        loader = DataLoader(torch.tensor(x).permute(0,3,1,2).float(), batch_size=batch_size)
+        self.base_network.eval()
+        embeds = []
+        with torch.no_grad():
+            for batch in loader:
+                embeds.append(self.base_network(batch))
+        self.base_network.train()
+        return torch.cat(embeds).cpu().numpy()
 
     def save_base_network(self, k):
-        (self.base_network).save_weights("./validation_models/base_network_partition_" + str(k) + ".h5")
-
-#early stopping based exclusively on the training loss value
-class EarlyStoppingByLossVal(Callback):
-    def __init__(self, monitor='loss', value=0.1):
-        super(Callback, self).__init__()
-        self.monitor = monitor
-        self.value = value
-
-    def on_epoch_end(self, epoch, logs={}):
-        current = logs.get(self.monitor)
-        if current < self.value:
-            self.model.stop_training = True
+        torch.save(self.base_network.state_dict(), f"./validation_models/base_network_partition_{k}.pt")
 
 import eeg
 import numpy as np
@@ -350,7 +342,7 @@ for train_index, test_index in loo.split(X):
     # create training+test positive and negative pairs
     tr_pairs, tr_y = create_pairs(X_train, y_train, n_channels=number_channels)
 
-    K.clear_session()
+    torch.cuda.empty_cache()
 
     s = siamese(input_shape, learning_rate=learning_rate,
                 final_dimension=final_dimension,
@@ -358,35 +350,22 @@ for train_index, test_index in loo.split(X):
                 regularization=regularization,
                 margin=margin_factor)
 
-    config = tf.ConfigProto()
-    config.gpu_options.allow_growth = True
-    session = tf.Session(config=config)
-    with session:
-        session.run(tf.global_variables_initializer())
-        #if model has a good validation decrease, model checkpoint can be
-        #removed
+    print("============================================")
+    print("STARTING PARTITION ", n_partition)
+    print("============================================")
 
-        print("============================================")
-        print("STARTING PARTITION ", n_partition)
-        print("============================================")
+    s.fit(tr_pairs, tr_y, batch_size=number_channels*16, epochs=epochs)
+    y_pred = s.predict(tr_pairs, batch_size=number_channels*16)
+    tr_acc = compute_accuracy(tr_y, y_pred)
 
-        history = s.model.fit([tr_pairs[:, 0], tr_pairs[:, 1]], tr_y,
-                  batch_size=number_channels*16,
-                  epochs=epochs)
+    print('* Accuracy on training set: %0.2f%%' % (100 * tr_acc))
 
-        y_pred = s.model.predict([tr_pairs[:, 0], 
-                                tr_pairs[:, 1]])
-        tr_acc = compute_accuracy(tr_y, y_pred)
+    s.save_base_network(n_partition)
 
-        print('* Accuracy on training set: %0.2f%%' % (100 * tr_acc))
+    X_train_features = s.get_embeddings(X_train)
+    X_test_features = s.get_embeddings(X_test)
 
-        s.save_base_network(n_partition)
-
-        #extract the embeddings from the base network
-        X_train_features = s.base_network.predict(X_train)
-        X_test_features = s.base_network.predict(X_test)
-
-    K.clear_session()
+    torch.cuda.empty_cache()
     #fit svm to data
     #######################################
     #SUPPORT VECTOS MACHINE
